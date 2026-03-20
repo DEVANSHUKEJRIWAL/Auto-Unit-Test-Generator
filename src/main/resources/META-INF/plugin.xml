@@ -1,0 +1,14 @@
+<idea-plugin>
+    <id>com.devanshu.sentinel</id>
+    <name>AutoTest Sentinel</name>
+    <vendor>Devanshu Kejriwal</vendor>
+
+    <depends>com.intellij.modules.platform</depends>
+    <depends>com.intellij.java</depends>
+    <depends>com.intellij.platform.lsp</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <platform.lsp.serverSupportProvider
+                implementation="com.sentinel.SentinelLspServerSupportProvider"/>
+    </extensions>
+</idea-plugin>
