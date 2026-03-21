@@ -11,14 +11,18 @@ import {
 import { CreateFile } from 'vscode-languageserver/node';
 
 import { TextDocument } from 'vscode-languageserver-textdocument';
-// @ts-ignore
-import {testGenGraph} from './agent';
+import {testGenGraph, codeHealerGraph} from './agent';
+import * as fs from 'fs';
 import {Diagnostic, DiagnosticSeverity} from "vscode-languageserver";
 import { CodeAction, CodeActionKind, Command } from 'vscode-languageserver/node';
+import { exec } from "child_process";
+import { promisify } from "util";
+import * as path from "path";
 
 // 1. Establish connection with the IDE (IntelliJ)
 const connection = createConnection(ProposedFeatures.all);
 const documents: TextDocuments<TextDocument> = new TextDocuments(TextDocument);
+const execAsync = promisify(exec);
 
 connection.onInitialize((params: InitializeParams) => {
     return {
@@ -28,7 +32,8 @@ connection.onInitialize((params: InitializeParams) => {
             codeActionProvider: true,
             // 2. Register a command to be executed
             executeCommandProvider: {
-                commands: ['sentinel.generateTestForLine']
+                commands: ['sentinel.generateTestForLine',// (If you have this one here)
+                    'sentinel.healCodeCommand']
             }
         }
     };
@@ -38,99 +43,170 @@ connection.onCodeAction((params) => {
     const textDocument = documents.get(params.textDocument.uri);
     if (!textDocument) return [];
 
-    const action = CodeAction.create(
+    // Button 1: The original Test Generator
+    const testAction = CodeAction.create(
         '✨ Sentinel: Generate Unit Test for this method',
-        Command.create(
-            'Generate Test',                  
-            'sentinel.generateTestForLine',   
-            params.textDocument.uri,          
-            params.range                      
-        ),
-        // THIS IS THE CRITICAL CHANGE
+        Command.create('Generate Test', 'sentinel.promptRequirements', params.textDocument.uri, params.range),
         CodeActionKind.QuickFix               
     );
 
-    return [action];
+    // Button 2: The NEW Code Healer
+    const healAction = CodeAction.create(
+        '🏥 Sentinel: Auto-Fix Code to Pass Tests',
+        Command.create('Heal Code', 'sentinel.healCodeCommand', params.textDocument.uri, params.range),
+        CodeActionKind.QuickFix
+    );
+
+    return [testAction, healAction];
 });
 
 connection.onExecuteCommand(async (params) => {
-    if (params.command === 'sentinel.generateTestForLine' && params.arguments) {
-        // Safely extract the arguments we passed in the CodeAction above
-        const uri = params.arguments[0] as string;
-        const range = params.arguments[1] as Range;
-        
+    
+    // ==========================================
+    // AGENT 1: THE TEST GENERATOR
+    // ==========================================
+    if (params.command === 'sentinel.generateTestForLine') {
+        const uri = params.arguments?.[0];
+        const range = params.arguments?.[1];
+        const requirements = params.arguments?.[2] || ""; 
         const document = documents.get(uri);
         if (!document) return;
 
-        connection.window.showInformationMessage('🧠 Sentinel is thinking...');
+        connection.window.showInformationMessage("🧠 Sentinel is generating tests...");
 
+        // 1. Trigger the Generator Agent
+        const result = await testGenGraph.invoke({
+            code: document.getText(),
+            testCode: "",
+            errors: [],
+            iterations: 0,
+            filePath: uri,
+            requirements: requirements
+        });
+
+        // 2. Automatically create the file and paste the test code
+        const testUri = uri.replace(/\.(ts|js)$/, '.test.$1');
+        const workspaceEdit: WorkspaceEdit = {
+            documentChanges: [
+                CreateFile.create(testUri, { overwrite: true, ignoreIfExists: true }),
+                {
+                    textDocument: { uri: testUri, version: null },
+                    edits: [
+                        { range: Range.create(0, 0, 0, 0), newText: result.testCode }
+                    ]
+                }
+            ]
+        };
+        await connection.workspace.applyEdit(workspaceEdit);
+        connection.window.showInformationMessage("✅ Sentinel successfully generated tests!");
+    }
+
+    // ==========================================
+    // AGENT 2: THE CODE HEALER
+    // ==========================================
+    if (params.command === 'sentinel.healCodeCommand') {
+        const uri = params.arguments?.[0];
+        const document = documents.get(uri);
+        if (!document) return;
+
+        const sourcePath = uri.replace('file://', '');
+        const testFileExt = sourcePath.endsWith('.ts') ? '.test.ts' : '.test.js';
+        const testPath = sourcePath.replace(/\.(ts|js)$/, testFileExt);
+
+        let testCode = "";
         try {
-            // Get just the text the user highlighted
-            const selectedText = document.getText(range);
-            
-            // Invoke your LangGraph agent
-            const result = await testGenGraph.invoke({
-                code: selectedText || document.getText(), // Fallback to whole file if no selection
-                testCode: "",
-                errors: [],
-                iterations: 0,
-                filePath: uri
-            });
-
-            if (result && result.testCode) {
-                await applyTestEdit(uri, result.testCode);
-            }
-        } catch (error: any) {
-            connection.window.showErrorMessage(`Sentinel Error: ${error.message}`);
+            testCode = fs.readFileSync(testPath, 'utf8');
+        } catch (e) {
+            connection.window.showErrorMessage("Sentinel: Could not find a matching test file! Please generate tests first.");
+            return;
         }
+
+        connection.window.showInformationMessage("🏥 Sentinel is diagnosing and healing your code...");
+
+        const result = await codeHealerGraph.invoke({
+            sourceCode: document.getText(),
+            testCode: testCode,
+            errors: [],
+            iterations: 0,
+            sourceFilePath: uri
+        });
+
+        const edit = {
+            changes: {
+                [uri]: [{
+                    range: {
+                        start: { line: 0, character: 0 },
+                        end: { line: document.lineCount, character: 0 }
+                    },
+                    newText: result.sourceCode
+                }]
+            }
+        };
+        connection.workspace.applyEdit(edit);
+        connection.window.showInformationMessage("✅ Sentinel successfully healed the code!");
     }
 });
 
 // 2. TRIGGER: This runs every time you save a file in IntelliJ
 documents.onDidSave(async (change) => {
     const document = change.document;
-    const code = document.getText();
     const uri = document.uri;
 
-    // Avoid self-triggering on test files
-    if (uri.includes('.test.') || uri.includes('.spec.')) {
+    // UPGRADED: A much stronger shield to ignore all variations of test files
+    if (
+        uri.includes('.test.') || 
+        uri.includes('.spec.') || 
+        uri.endsWith('test.ts') || 
+        uri.endsWith('test.js')
+    ) {
         return;
     }
 
-    connection.console.log(`Sentinel Agent: Processing ${uri}...`);
+    const sourcePath = uri.replace('file://', '');
+    const testFileExt = sourcePath.endsWith('.ts') ? '.test.ts' : '.test.js';
+    const testPath = sourcePath.replace(/\.(ts|js)$/, testFileExt);
+
+    if (!fs.existsSync(testPath)) {
+        return; 
+    }
+
+    connection.console.log(`\n👀 [Sentinel Watcher] File saved. Running regression tests for ${sourcePath}...`);
 
     try {
-        // 3. INVOKE AGENT: Call your LangGraph Self-Healing Logic
-        const result = await testGenGraph.invoke({
-            code: code,
-            testCode: "",
-            errors: [],
-            iterations: 0
+        const workspaceDir = path.dirname(sourcePath);
+
+        // Tell Vitest to run specifically inside that folder
+        await execAsync(`npx vitest run "${testPath}" --coverage`, { cwd: workspaceDir });
+
+        // SUCCESS! Use the unmodified document.uri to clear the squiggly
+        connection.sendDiagnostics({ 
+            uri: document.uri, 
+            diagnostics: [] 
+        });
+        connection.console.log(`✅ [Sentinel Watcher] All tests passed. Diagnostics cleared.`);
+        
+    } catch (error: any) {
+        // Let's print the actual error to the Output panel so we know WHY it failed
+        connection.console.log(`❌ [Sentinel Watcher] Test run failed! Reason:`);
+        connection.console.log(error.stdout || error.message);
+        
+        const diagnostic: Diagnostic = {
+            severity: DiagnosticSeverity.Error,
+            range: {
+                start: { line: 0, character: 0 },
+                end: { line: 0, character: 100 } 
+            },
+            message: '🚨 Sentinel: You broke a unit test! Click the lightbulb (Cmd + .) to Auto-Fix.',
+            source: 'Sentinel'
+        };
+
+        // Use the unmodified document.uri to apply the squiggly
+        connection.sendDiagnostics({ 
+            uri: document.uri, 
+            diagnostics: [diagnostic] 
         });
 
-        if (result.testCode) {
-            connection.console.log(`Sentinel Agent: Test generated successfully.`);
-
-            // 4. AUTOMATIC FILE CREATION: Tell IntelliJ to create the test file
-            const testUri = uri.replace(/\.(ts|js|java)$/, '.test.$1');
-
-            const workspaceEdit: WorkspaceEdit = {
-                changes: {
-                    [testUri]: [
-                        {
-                            range: Range.create(0, 0, 0, 0),
-                            newText: result.testCode
-                        }
-                    ]
-                }
-            };
-
-            // This pushes the generated code back into the IDE workspace
-            await connection.workspace.applyEdit(workspaceEdit);
-            connection.window.showInformationMessage(`Sentinel: Generated test for ${uri.split('/').pop()}`);
-        }
-    } catch (error) {
-        connection.console.error(`Sentinel Error: ${error}`);
+        connection.window.showErrorMessage("🚨 Sentinel: Regression detected!");
     }
 });
 
